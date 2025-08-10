@@ -19,66 +19,98 @@ pub const Pcap = struct {
     const Self = @This();
 
     allocator: Allocator,
+    // TODO: In the future, it would be nice to give an option to not
+    // keep all records around, but it's easier for now so that the
+    // iterator works multiple times without rereading the file
+    records: []Record,
     reader: std.fs.File.Reader,
 
     global_header: GlobalHeader,
 
     pub fn init(file: std.fs.File, allocator: Allocator) !Self {
-        var reader = file.reader();
+        var reader: std.fs.File.Reader = file.reader();
         const global_header = try GlobalHeader.init(&reader);
-        return .{
+        var pcap: Self = .{
             .allocator = allocator,
+            .records = &.{},
             .reader = reader,
             .global_header = global_header,
         };
+
+        try pcap.populate_records();
+        return pcap;
+    }
+
+    pub fn deinit(self: *Self) void {
+        for (self.records) |record| {
+            self.allocator.free(record.data);
+        }
+        self.allocator.free(self.records);
+    }
+
+    fn populate_records(self: *Self) !void {
+        var records = std.ArrayList(Record).init(self.allocator);
+        while (true) {
+            var header_buf: [(@bitSizeOf(RecordHeader) / 8)]u8 = undefined;
+
+            const read = try self.reader.readAll(&header_buf);
+
+            // EOF
+            if (read == 0) break;
+
+            const header: RecordHeader = @bitCast(header_buf);
+
+            // Now read the packet data
+            var buffer = try std.ArrayList(u8).initCapacity(self.allocator, header.incl_len);
+            buffer.items.len = header.incl_len;
+
+            const read_packet = try self.reader.readAll(buffer.items);
+            // EOF - TODO: Error here?
+            if (read_packet == 0) break;
+
+            var record = Record{
+                .header = header,
+                .eth_frame = null,
+                .data = try buffer.toOwnedSlice(),
+            };
+
+            switch (self.global_header.network) {
+                .ethernet => {
+                    record.eth_frame = try EthernetFrame.init(record.data);
+                },
+                else => {},
+            }
+
+            try records.append(record);
+        }
+
+        self.records = try records.toOwnedSlice();
     }
 
     pub fn iterator(self: *Self) PcapIterator {
         return PcapIterator{
             .pcap = self,
-            .buffer = std.ArrayList(u8).init(self.allocator),
         };
     }
 
     pub const PcapIterator = struct {
         pcap: *Pcap,
-        buffer: std.ArrayList(u8),
-
-        pub const Record = struct {
-            header: RecordHeader,
-            data: []const u8,
-        };
-
-        pub fn deinit(self: *PcapIterator) void {
-            self.buffer.deinit();
-        }
+        pos: usize = 0,
 
         pub fn next(self: *PcapIterator) !?Record {
-            var header_buf: [(@bitSizeOf(RecordHeader) / 8)]u8 = undefined;
-
-            const read = try self.pcap.reader.readAll(&header_buf);
-
-            // EOF
-            if (read == 0) return null;
-
-            const header: RecordHeader = @bitCast(header_buf);
-
-            // Now read the packet data
-            // TODO: Is the clear necessary?
-            self.buffer.clearRetainingCapacity();
-            try self.buffer.ensureTotalCapacity(header.incl_len);
-            self.buffer.items.len = header.incl_len;
-
-            const read_packet = try self.pcap.reader.readAll(self.buffer.items);
-            // EOF
-            if (read_packet == 0) return null;
-
-            return Record{
-                .header = header,
-                .data = self.buffer.items,
-            };
+            if (self.pos >= self.pcap.records.len) return null;
+            const record = self.pcap.records[self.pos];
+            self.pos += 1;
+            return record;
         }
     };
+};
+
+pub const LinkType = enum(u32) {
+    null = 0,
+    ethernet = 1,
+    exp_ethernet = 2,
+    _,
 };
 
 pub const GlobalHeader = packed struct {
@@ -90,13 +122,23 @@ pub const GlobalHeader = packed struct {
     thiszone: u32,
     sigfigs: u32,
     snaplen: u32,
-    network: u32,
+    network: LinkType,
 
     pub fn init(reader: *std.fs.File.Reader) !Self {
         var buf: [(@bitSizeOf(GlobalHeader) / 8)]u8 = undefined;
         _ = try reader.readAll(&buf);
         return @bitCast(buf);
     }
+};
+
+pub const Record = struct {
+    header: RecordHeader,
+    // TODO: If more than ethernet gets supported this would
+    // be a tagged union
+    eth_frame: ?EthernetFrame,
+    // TODO: If this is ethernet, this includes the frame, and it probably
+    // shouldn't?
+    data: []const u8,
 };
 
 pub const RecordHeader = packed struct {
@@ -108,16 +150,47 @@ pub const RecordHeader = packed struct {
     orig_len: u32,
 };
 
+pub const MacAddress = struct {
+    bytes: [6]u8,
+};
+
+pub const EthernetFrame = struct {
+    dst_mac: MacAddress,
+    src_mac: MacAddress,
+    ethertype: u16,
+
+    pub fn init(data: []const u8) !EthernetFrame {
+        if (data.len < 14) {
+            return error.InvalidEthernetFrame;
+        }
+
+        var dst_mac_bytes: [6]u8 = undefined;
+        @memcpy(&dst_mac_bytes, data[0..6]);
+
+        var src_mac_bytes: [6]u8 = undefined;
+        @memcpy(&src_mac_bytes, data[6..12]);
+
+        const ethertype = std.mem.readInt(u16, data[12..14], .big);
+
+        return EthernetFrame{
+            .dst_mac = MacAddress{ .bytes = dst_mac_bytes },
+            .src_mac = MacAddress{ .bytes = src_mac_bytes },
+            .ethertype = ethertype,
+        };
+    }
+};
+
 test "Basic headers" {
     const file = try std.fs.cwd().openFile("test/http.pcap", .{ .mode = .read_only });
     defer file.close();
 
     var pcap = try Pcap.init(file, std.testing.allocator);
+    defer pcap.deinit();
     // Just sanity check the magic number and packet numbers
     try std.testing.expectEqual(pcap.global_header.magic_number, Magic.tcpdump);
+    try std.testing.expectEqual(pcap.global_header.network, LinkType.ethernet);
 
     var it = pcap.iterator();
-    defer it.deinit();
 
     var count: usize = 0;
     while (try it.next()) |_| {

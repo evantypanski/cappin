@@ -1,11 +1,12 @@
 const std = @import("std");
 const Pcap = @import("pcap.zig").Pcap;
+const GlobalHeader = @import("pcap.zig").GlobalHeader;
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 /// Our main application state
 pub const Model = struct {
-    pcap: Pcap,
+    pcap: *Pcap,
     /// State of the counter
     count: u32 = 0,
     /// The button. This widget is stateful and must live between frames
@@ -61,8 +62,23 @@ pub const Model = struct {
         // lifetime of this allocation is until the next time we draw a frame. This is useful for
         // temporary allocations such as the one below: we have an integer we want to print as text.
         // We can safely allocate this with the ctx arena since we only need it for this frame.
-        const global_header_text = try std.fmt.allocPrint(ctx.arena, "Magic number: {d}\nVersion: {d}.{d}\n", .{ self.pcap.global_header.magic_number, self.pcap.global_header.version_major, self.pcap.global_header.version_minor });
-        const text: vxfw.Text = .{ .text = global_header_text };
+        var txt = try std.fmt.allocPrint(ctx.arena, "Magic number: {d}\nVersion: {d}.{d}\n", .{ self.pcap.*.global_header.magic_number, self.pcap.*.global_header.version_major, self.pcap.*.global_header.version_minor });
+
+        var it = self.pcap.*.iterator();
+        var count: usize = 0;
+        std.debug.print("Starting iterating pcap", .{});
+        while (it.next() catch return error.OutOfMemory) |record| {
+            txt = try std.fmt.allocPrint(ctx.arena, "{s}Record {d} length {d}\n", .{ txt, count, record.header.incl_len });
+            if (record.eth_frame) |eth| {
+                txt = try std.fmt.allocPrint(ctx.arena, "{s}dest mac: {s}, src mac: {s}\n", .{ txt, eth.dst_mac.bytes, eth.src_mac.bytes });
+            } else {
+                txt = try std.fmt.allocPrint(ctx.arena, "{s}Not ethernet!\n", .{txt});
+            }
+            count += 1;
+        }
+        std.debug.print("Done iterating pcap", .{});
+
+        const text: vxfw.Text = .{ .text = txt };
 
         const text_child: vxfw.SubSurface = .{
             .origin = .{ .row = 0, .col = 0 },
