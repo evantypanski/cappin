@@ -29,6 +29,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // add vaxis dependency to module
+    const vaxis = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    exe_mod.addImport("vaxis", vaxis.module("vaxis"));
+
     // This creates another `std.Build.Step.Compile`, but this one builds an executable
     // rather than a static library.
     const exe = b.addExecutable(.{

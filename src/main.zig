@@ -1,5 +1,8 @@
 const std = @import("std");
 const Pcap = @import("pcap.zig").Pcap;
+const Model = @import("tui.zig").Model;
+const vaxis = @import("vaxis");
+const vxfw = vaxis.vxfw;
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -22,6 +25,25 @@ pub fn main() !void {
     }
 
     std.debug.print("Found {d} records!\n", .{count});
+
+    var app = try vxfw.App.init(allocator);
+    defer app.deinit();
+
+    const model = try allocator.create(Model);
+    defer allocator.destroy(model);
+
+    // Set the initial state of our button
+    model.* = .{
+        .pcap = pcap,
+        .count = 0,
+        .button = .{
+            .label = "Click me!",
+            .onClick = Model.onClick,
+            .userdata = model,
+        },
+    };
+
+    try app.run(model.widget(), .{});
 }
 
 test {
