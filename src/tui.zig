@@ -1,124 +1,299 @@
 const std = @import("std");
-const Pcap = @import("pcap.zig").Pcap;
-const GlobalHeader = @import("pcap.zig").GlobalHeader;
 const vaxis = @import("vaxis");
-const vxfw = vaxis.vxfw;
+const Cell = vaxis.Cell;
+const TextInput = vaxis.widgets.TextInput;
+const border = vaxis.widgets.border;
+const pcap = @import("pcap.zig");
 
-/// Our main application state
-pub const Model = struct {
-    pcap: *Pcap,
-    /// State of the counter
-    count: u32 = 0,
-    /// The button. This widget is stateful and must live between frames
-    button: vxfw.Button,
+const ActiveSection = enum {
+    top,
+    mid,
+    btm,
+};
 
-    /// Helper function to return a vxfw.Widget struct
-    pub fn widget(self: *Model) vxfw.Widget {
-        return .{
-            .userdata = self,
-            .eventHandler = Model.typeErasedEventHandler,
-            .drawFn = Model.typeErasedDrawFn,
-        };
-    }
+pub fn tui(alloc: std.mem.Allocator, processed_pcap: *pcap.Pcap) !void {
+    // Users set up below the main function
+    const records_buf = try alloc.dupe(pcap.Record, processed_pcap.records[0..]);
+    const record_list = std.ArrayList(pcap.Record).fromOwnedSlice(alloc, records_buf);
+    defer record_list.deinit();
+    var record_mal = std.MultiArrayList(pcap.Record){};
+    for (records_buf[0..]) |user| try record_mal.append(alloc, user);
+    defer record_mal.deinit(alloc);
 
-    /// This function will be called from the vxfw runtime.
-    fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
-        const self: *Model = @ptrCast(@alignCast(ptr));
+    var tty = try vaxis.Tty.init();
+    defer tty.deinit();
+    var tty_buf_writer = tty.bufferedWriter();
+    defer tty_buf_writer.flush() catch {};
+    const tty_writer = tty_buf_writer.writer().any();
+    var vx = try vaxis.init(alloc, .{
+        .kitty_keyboard_flags = .{ .report_events = true },
+    });
+    defer vx.deinit(alloc, tty.anyWriter());
+
+    var loop: vaxis.Loop(union(enum) {
+        key_press: vaxis.Key,
+        winsize: vaxis.Winsize,
+        table_upd,
+    }) = .{ .tty = &tty, .vaxis = &vx };
+    try loop.init();
+    try loop.start();
+    defer loop.stop();
+    try vx.enterAltScreen(tty.anyWriter());
+    try vx.queryTerminal(tty.anyWriter(), 250 * std.time.ns_per_ms);
+
+    const logo =
+        \\░█░█░█▀█░█░█░▀█▀░█▀▀░░░▀█▀░█▀█░█▀▄░█░░░█▀▀░
+        \\░▀▄▀░█▀█░▄▀▄░░█░░▀▀█░░░░█░░█▀█░█▀▄░█░░░█▀▀░
+        \\░░▀░░▀░▀░▀░▀░▀▀▀░▀▀▀░░░░▀░░▀░▀░▀▀░░▀▀▀░▀▀▀░
+    ;
+    const title_logo = vaxis.Cell.Segment{
+        .text = logo,
+        .style = .{},
+    };
+    const title_info = vaxis.Cell.Segment{
+        .text = "===A Demo of the the Vaxis Table Widget!===",
+        .style = .{},
+    };
+    const title_disclaimer = vaxis.Cell.Segment{
+        .text = "(All data is non-sensical & LLM generated.)",
+        .style = .{},
+    };
+    var title_segs = [_]vaxis.Cell.Segment{ title_logo, title_info, title_disclaimer };
+
+    var cmd_input = vaxis.widgets.TextInput.init(alloc, &vx.unicode);
+    defer cmd_input.deinit();
+
+    // Colors
+    const active_bg: vaxis.Cell.Color = .{ .rgb = .{ 64, 128, 255 } };
+    const selected_bg: vaxis.Cell.Color = .{ .rgb = .{ 32, 64, 255 } };
+    const other_bg: vaxis.Cell.Color = .{ .rgb = .{ 32, 32, 48 } };
+
+    // Table Context
+    var demo_tbl: vaxis.widgets.Table.TableContext = .{
+        .active_bg = active_bg,
+        .active_fg = .{ .rgb = .{ 0, 0, 0 } },
+        .row_bg_1 = .{ .rgb = .{ 8, 8, 8 } },
+        .selected_bg = selected_bg,
+        .header_names = .{ .custom = &.{ "Header", "Ethernet frame", "data" } },
+        //.header_align = .left,
+        .col_indexes = .{ .by_idx = &.{ 0, 1, 2 } },
+        //.col_align = .{ .by_idx = &.{ .left, .left, .center, .center, .left } },
+        //.col_align = .{ .all = .center },
+        //.header_borders = true,
+        //.col_borders = true,
+        //.col_width = .{ .static_all = 15 },
+        //.col_width = .{ .dynamic_header_len = 3 },
+        //.col_width = .{ .static_individual = &.{ 10, 20, 15, 25, 15 } },
+        //.col_width = .dynamic_fill,
+        //.y_off = 10,
+    };
+    defer if (demo_tbl.sel_rows) |rows| alloc.free(rows);
+
+    // TUI State
+    var active: ActiveSection = .mid;
+    var moving = false;
+    var see_content = false;
+
+    // Create an Arena Allocator for easy allocations on each Event.
+    var event_arena = std.heap.ArenaAllocator.init(alloc);
+    defer event_arena.deinit();
+    while (true) {
+        defer _ = event_arena.reset(.retain_capacity);
+        defer tty_buf_writer.flush() catch {};
+        const event_alloc = event_arena.allocator();
+        const event = loop.nextEvent();
+
         switch (event) {
-            // The root widget is always sent an init event as the first event. Users of the
-            // library can also send this event to other widgets they create if they need to do
-            // some initialization.
-            .init => return ctx.requestFocus(self.button.widget()),
-            .key_press => |key| {
+            .key_press => |key| keyEvt: {
+                // Close the Program
                 if (key.matches('c', .{ .ctrl = true })) {
-                    ctx.quit = true;
-                    return;
+                    break;
                 }
+                // Refresh the Screen
+                if (key.matches('l', .{ .ctrl = true })) {
+                    vx.queueRefresh();
+                    break :keyEvt;
+                }
+                // Enter Moving State
+                if (key.matches('w', .{ .ctrl = true })) {
+                    moving = !moving;
+                    break :keyEvt;
+                }
+                // Command State
+                if (active != .btm and
+                    key.matchesAny(&.{ ':', '/', 'g', 'G' }, .{}))
+                {
+                    active = .btm;
+                    cmd_input.clearAndFree();
+                    try cmd_input.update(.{ .key_press = key });
+                    break :keyEvt;
+                }
+
+                switch (active) {
+                    .top => {
+                        if (key.matchesAny(&.{ vaxis.Key.down, 'j' }, .{}) and moving) active = .mid;
+                    },
+                    .mid => midEvt: {
+                        if (moving) {
+                            if (key.matchesAny(&.{ vaxis.Key.up, 'k' }, .{})) active = .top;
+                            if (key.matchesAny(&.{ vaxis.Key.down, 'j' }, .{})) active = .btm;
+                            break :midEvt;
+                        }
+                        // Change Row
+                        if (key.matchesAny(&.{ vaxis.Key.up, 'k' }, .{})) demo_tbl.row -|= 1;
+                        if (key.matchesAny(&.{ vaxis.Key.down, 'j' }, .{})) demo_tbl.row +|= 1;
+                        // Change Column
+                        if (key.matchesAny(&.{ vaxis.Key.left, 'h' }, .{})) demo_tbl.col -|= 1;
+                        if (key.matchesAny(&.{ vaxis.Key.right, 'l' }, .{})) demo_tbl.col +|= 1;
+                        // Select/Unselect Row
+                        if (key.matches(vaxis.Key.space, .{})) {
+                            const rows = demo_tbl.sel_rows orelse createRows: {
+                                demo_tbl.sel_rows = try alloc.alloc(u16, 1);
+                                break :createRows demo_tbl.sel_rows.?;
+                            };
+                            var rows_list = std.ArrayList(u16).fromOwnedSlice(alloc, rows);
+                            for (rows_list.items, 0..) |row, idx| {
+                                if (row != demo_tbl.row) continue;
+                                _ = rows_list.orderedRemove(idx);
+                                break;
+                            } else try rows_list.append(demo_tbl.row);
+                            demo_tbl.sel_rows = try rows_list.toOwnedSlice();
+                        }
+                        // See Row Content
+                        if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) see_content = !see_content;
+                    },
+                    .btm => {
+                        if (key.matchesAny(&.{ vaxis.Key.up, 'k' }, .{}) and moving) active = .mid
+                        // Run Command and Clear Command Bar
+                        else if (key.matchExact(vaxis.Key.enter, .{}) or key.matchExact('j', .{ .ctrl = true })) {
+                            const cmd = try cmd_input.toOwnedSlice();
+                            defer alloc.free(cmd);
+                            if (std.mem.eql(u8, ":q", cmd) or
+                                std.mem.eql(u8, ":quit", cmd) or
+                                std.mem.eql(u8, ":exit", cmd)) return;
+                            if (std.mem.eql(u8, "G", cmd)) {
+                                demo_tbl.row = @intCast(record_list.items.len - 1);
+                                active = .mid;
+                            }
+                            if (cmd.len >= 2 and std.mem.eql(u8, "gg", cmd[0..2])) {
+                                const goto_row = std.fmt.parseInt(u16, cmd[2..], 0) catch 0;
+                                demo_tbl.row = goto_row;
+                                active = .mid;
+                            }
+                        } else try cmd_input.update(.{ .key_press = key });
+                    },
+                }
+                moving = false;
             },
-            // We can request a specific widget gets focus. In this case, we always want to focus
-            // our button. Having focus means that key events will be sent up the widget tree to
-            // the focused widget, and then bubble back down the tree to the root. Users can tell
-            // the runtime the event was handled and the capture or bubble phase will stop
-            .focus_in => return ctx.requestFocus(self.button.widget()),
+            .winsize => |ws| try vx.resize(alloc, tty.anyWriter(), ws),
             else => {},
         }
-    }
 
-    /// This function is called from the vxfw runtime. It will be called on a regular interval, and
-    /// only when any event handler has marked the redraw flag in EventContext as true. By
-    /// explicitly requiring setting the redraw flag, vxfw can prevent excessive redraws for events
-    /// which don't change state (ie mouse motion, unhandled key events, etc)
-    fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *Model = @ptrCast(@alignCast(ptr));
-        // The DrawContext is inspired from Flutter. Each widget will receive a minimum and maximum
-        // constraint. The minimum constraint will always be set, even if it is set to 0x0. The
-        // maximum constraint can have null width and/or height - meaning there is no constraint in
-        // that direction and the widget should take up as much space as it needs. By calling size()
-        // on the max, we assert that it has some constrained size. This is *always* the case for
-        // the root widget - the maximum size will always be the size of the terminal screen.
-        const max_size = ctx.max.size();
-
-        // The DrawContext also contains an arena allocator that can be used for each frame. The
-        // lifetime of this allocation is until the next time we draw a frame. This is useful for
-        // temporary allocations such as the one below: we have an integer we want to print as text.
-        // We can safely allocate this with the ctx arena since we only need it for this frame.
-        var txt = try std.fmt.allocPrint(ctx.arena, "Magic number: {d}\nVersion: {d}.{d}\n", .{ self.pcap.*.global_header.magic_number, self.pcap.*.global_header.version_major, self.pcap.*.global_header.version_minor });
-
-        var it = self.pcap.*.iterator();
-        var count: usize = 0;
-        std.debug.print("Starting iterating pcap", .{});
-        while (it.next() catch return error.OutOfMemory) |record| {
-            txt = try std.fmt.allocPrint(ctx.arena, "{s}Record {d} length {d}\n", .{ txt, count, record.header.incl_len });
-            if (record.eth_frame) |eth| {
-                txt = try std.fmt.allocPrint(ctx.arena, "{s}dest mac: {s}, src mac: {s}\n", .{ txt, eth.dst_mac.bytes, eth.src_mac.bytes });
-            } else {
-                txt = try std.fmt.allocPrint(ctx.arena, "{s}Not ethernet!\n", .{txt});
+        // Content
+        seeRow: {
+            if (!see_content) {
+                demo_tbl.active_content_fn = null;
+                demo_tbl.active_ctx = &{};
+                break :seeRow;
             }
-            count += 1;
+            const RowContext = struct {
+                row: []const u8,
+                bg: vaxis.Color,
+            };
+            const row_ctx = RowContext{
+                .row = try std.fmt.allocPrint(event_alloc, "Row #: {d}", .{demo_tbl.row}),
+                .bg = demo_tbl.active_bg,
+            };
+            demo_tbl.active_ctx = &row_ctx;
+            demo_tbl.active_content_fn = struct {
+                fn see(win: *vaxis.Window, ctx_raw: *const anyopaque) !u16 {
+                    const ctx: *const RowContext = @alignCast(@ptrCast(ctx_raw));
+                    win.height = 5;
+                    const see_win = win.child(.{
+                        .x_off = 0,
+                        .y_off = 1,
+                        .width = win.width,
+                        .height = 4,
+                    });
+                    see_win.fill(.{ .style = .{ .bg = ctx.bg } });
+                    const content_logo =
+                        \\
+                        \\░█▀▄░█▀█░█░█░░░█▀▀░█▀█░█▀█░▀█▀░█▀▀░█▀█░▀█▀
+                        \\░█▀▄░█░█░█▄█░░░█░░░█░█░█░█░░█░░█▀▀░█░█░░█░
+                        \\░▀░▀░▀▀▀░▀░▀░░░▀▀▀░▀▀▀░▀░▀░░▀░░▀▀▀░▀░▀░░▀░
+                    ;
+                    const content_segs: []const vaxis.Cell.Segment = &.{
+                        .{
+                            .text = ctx.row,
+                            .style = .{ .bg = ctx.bg },
+                        },
+                        .{
+                            .text = content_logo,
+                            .style = .{ .bg = ctx.bg },
+                        },
+                    };
+                    _ = see_win.print(content_segs, .{});
+                    return see_win.height;
+                }
+            }.see;
+            loop.postEvent(.table_upd);
         }
-        std.debug.print("Done iterating pcap", .{});
 
-        const text: vxfw.Text = .{ .text = txt };
+        // Sections
+        // - Window
+        const win = vx.window();
+        win.clear();
 
-        const text_child: vxfw.SubSurface = .{
-            .origin = .{ .row = 0, .col = 0 },
-            .surface = try text.draw(ctx),
-        };
+        // - Top
+        const top_div = 6;
+        const top_bar = win.child(.{
+            .x_off = 0,
+            .y_off = 0,
+            .width = win.width,
+            .height = win.height / top_div,
+        });
+        for (title_segs[0..]) |*title_seg|
+            title_seg.style.bg = if (active == .top) selected_bg else other_bg;
+        top_bar.fill(.{ .style = .{
+            .bg = if (active == .top) selected_bg else other_bg,
+        } });
+        const logo_bar = vaxis.widgets.alignment.center(
+            top_bar,
+            44,
+            top_bar.height - (top_bar.height / 3),
+        );
+        _ = logo_bar.print(title_segs[0..], .{ .wrap = .word });
 
-        const button_child: vxfw.SubSurface = .{
-            .origin = .{ .row = 2, .col = 0 },
-            .surface = try self.button.draw(ctx.withConstraints(
-                ctx.min,
-                // Here we explicitly set a new maximum size constraint for the Button. A Button will
-                // expand to fill its area and must have some hard limit in the maximum constraint
-                .{ .width = 16, .height = 3 },
-            )),
-        };
+        // - Middle
+        const middle_bar = win.child(.{
+            .x_off = 0,
+            .y_off = win.height / top_div,
+            .width = win.width,
+            .height = win.height - (top_bar.height + 1),
+        });
+        if (record_list.items.len > 0) {
+            demo_tbl.active = active == .mid;
+            try vaxis.widgets.Table.drawTable(
+                event_alloc,
+                middle_bar,
+                //users_buf[0..],
+                //user_list,
+                record_mal,
+                &demo_tbl,
+            );
+        }
 
-        // We also can use our arena to allocate the slice for our SubSurfaces. This slice only
-        // needs to live until the next frame, making this safe.
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 2);
-        children[0] = text_child;
-        children[1] = button_child;
+        // - Bottom
+        const bottom_bar = win.child(.{
+            .x_off = 0,
+            .y_off = win.height - 1,
+            .width = win.width,
+            .height = 1,
+        });
+        if (active == .btm) bottom_bar.fill(.{ .style = .{ .bg = active_bg } });
+        cmd_input.draw(bottom_bar);
 
-        return .{
-            // A Surface must have a size. Our root widget is the size of the screen
-            .size = max_size,
-            .widget = self.widget(),
-            // We didn't actually need to draw anything for the root. In this case, we can set
-            // buffer to a zero length slice. If this slice is *not zero length*, the runtime will
-            // assert that its length is equal to the size.width * size.height.
-            .buffer = &.{},
-            .children = children,
-        };
+        // Render the screen
+        try vx.render(tty_writer);
     }
-
-    /// The onClick callback for our button. This is also called if we press enter while the button
-    /// has focus
-    pub fn onClick(maybe_ptr: ?*anyopaque, ctx: *vxfw.EventContext) anyerror!void {
-        const ptr = maybe_ptr orelse return;
-        const self: *Model = @ptrCast(@alignCast(ptr));
-        self.count +|= 1;
-        return ctx.consumeAndRedraw();
-    }
-};
+}
