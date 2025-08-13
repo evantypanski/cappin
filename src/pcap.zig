@@ -71,12 +71,16 @@ pub const Pcap = struct {
             var record = Record{
                 .header = header,
                 .eth_frame = null,
+                .ipv4_packet = null,
                 .data = try buffer.toOwnedSlice(),
             };
 
             switch (self.global_header.network) {
                 .ethernet => {
                     record.eth_frame = try EthernetFrame.init(record.data);
+                    if (record.eth_frame.?.ethertype == EtherType.ipv4) {
+                        record.ipv4_packet = try IPV4Packet.init(record.data[@sizeOf(EthernetFrame)..]);
+                    }
                 },
                 else => {},
             }
@@ -136,6 +140,8 @@ pub const Record = struct {
     // TODO: If more than ethernet gets supported this would
     // be a tagged union
     eth_frame: ?EthernetFrame,
+    // This would possibly live within ^ as a tagged union
+    ipv4_packet: ?IPV4Packet,
     // TODO: If this is ethernet, this includes the frame, and it probably
     // shouldn't?
     data: []const u8,
@@ -154,10 +160,16 @@ pub const MacAddress = struct {
     bytes: [6]u8,
 };
 
+pub const EtherType = enum(u16) {
+    ipv4 = 0x0800,
+    ipv6 = 0x86DD,
+    _,
+};
+
 pub const EthernetFrame = struct {
     dst_mac: MacAddress,
     src_mac: MacAddress,
-    ethertype: u16,
+    ethertype: EtherType,
 
     pub fn init(data: []const u8) !EthernetFrame {
         if (data.len < 14) {
@@ -175,8 +187,39 @@ pub const EthernetFrame = struct {
         return EthernetFrame{
             .dst_mac = MacAddress{ .bytes = dst_mac_bytes },
             .src_mac = MacAddress{ .bytes = src_mac_bytes },
-            .ethertype = ethertype,
+            .ethertype = @enumFromInt(ethertype),
         };
+    }
+};
+
+pub const IPV4Packet = struct {
+    header: IPV4Header,
+    payload: []const u8,
+
+    pub fn init(data: []const u8) !IPV4Packet {
+        return .{
+            .header = try IPV4Header.init(data),
+            .payload = data[@sizeOf(IPV4Header)..],
+        };
+    }
+};
+
+// TODO: Byte order, think that's based on the pcap.
+pub const IPV4Header = packed struct {
+    version: u4,
+    ihl: u4,
+    tos: u8,
+    tot_len: u16,
+    id: u16,
+    frag_off: u16,
+    ttl: u8,
+    protocol: u8,
+    check: u16,
+    saddr: u32,
+    daddr: u32,
+
+    pub fn init(data: []const u8) !IPV4Header {
+        return @bitCast(data[0 .. @bitSizeOf(IPV4Header) / 8].*);
     }
 };
 
@@ -193,7 +236,9 @@ test "Basic headers" {
     var it = pcap.iterator();
 
     var count: usize = 0;
-    while (try it.next()) |_| {
+    while (try it.next()) |r| {
+        std.debug.print("ethertype: {d}\n", .{r.eth_frame.?.ethertype});
+        std.debug.print("protocol: {d}\n", .{r.ipv4_packet.?.header.protocol});
         count += 1;
     }
     try std.testing.expectEqual(count, 43);
